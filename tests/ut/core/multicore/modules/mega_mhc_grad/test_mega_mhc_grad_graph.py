@@ -47,6 +47,44 @@ class TestMegaMhcGradGraph(unittest.TestCase):
 
     @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
               card_mark="allcards", essential_mark="essential")
+    def test_ordered_projection_waits_for_all_parallel_mapping_tiles(self) -> None:
+        """Feature: Ordered projection reduction with parallel vector stages.
+
+        Description: Materialize short, partial-tile, and full training shapes.
+        Expectation: One projection task waits for every producer and outputs cover all tokens.
+        """
+        for tokens in (40, 65, 2048, 16384):
+            for parallel_output in (False, True):
+                with self.subTest(tokens=tokens, parallel_output=parallel_output):
+                    graph, topology = build_mega_mhc_grad_graph(
+                        tokens, 5120, token_tile=32, num_vector_cores=NUM_VECTOR_CORES,
+                        parallel_previous_x=parallel_output, ordered_projection=True,
+                    )
+                    config = build_runtime_config(graph, topology, num_cube_cores=NUM_CUBE_CORES)
+                    order_vector_tasks_by_stage(config)
+                    _validate_runtime_task_queues(config, config.event_capacity)
+                    tasks = config.all_tasks[:config.task_num]
+                    mapping = [task for task in tasks
+                               if task.task_type == TaskType.TASK_MHC_GRAD_PREV_A_AND_MAPPING]
+                    projection = [task for task in tasks if task.task_type == TaskType.TASK_MHC_GRAD_PHI_RMS]
+                    outputs = [task for task in tasks if task.task_type == TaskType.TASK_MHC_GRAD_PREV_X_AND_POST]
+                    self.assertGreater(len(mapping), 1)
+                    self.assertEqual(len(projection), 1)
+                    self.assertEqual(projection[0].task_index, 0)
+                    self.assertEqual(projection[0].task_split_value, tokens)
+                    dependency = projection[0].dependent_event
+                    self.assertEqual({task.trigger_event for task in mapping}, {dependency})
+                    self.assertEqual(config.all_event_num_triggers[dependency], len(mapping))
+                    cursor = 0
+                    for task in outputs:
+                        self.assertEqual(task.dependent_event, projection[0].trigger_event)
+                        self.assertEqual(task.task_index * task.task_split_value, cursor)
+                        cursor += min(task.task_split_value, tokens - cursor)
+                    self.assertEqual(cursor, tokens)
+                    self.assertEqual(config.all_event_num_triggers[outputs[0].trigger_event], len(outputs))
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
     def test_ordered_reductions_allow_disjoint_parallel_activation_outputs(self) -> None:
         """Feature: Deterministic mHC final-stage parallelism.
 

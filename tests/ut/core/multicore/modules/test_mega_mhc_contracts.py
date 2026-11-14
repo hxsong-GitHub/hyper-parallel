@@ -295,13 +295,15 @@ class TestMegaMhcInvocationState(unittest.TestCase):
                          (True, True, True, 32), (False, False, True, 32),
                          (False, False, False, 32))
                 for enabled, warn_only, allow_parallel, expected_tile in cases:
-                    with self.subTest(enabled=enabled, warn_only=warn_only, allow_parallel=allow_parallel):
+                    for ordered_projection in (False, True):
                         torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
                         options = {"allow_parallel_reduction": True} if allow_parallel else {}
+                        options["ordered_projection"] = ordered_projection
                         outputs = function.hyper_mega_mhc_grad(
                             *_make_gradients(), *inputs, cache, token_tile=32, **options,
                         )
                         self.assertEqual(get_plan.call_args.args, (40, 128, 0, 20, 40, expected_tile))
+                        self.assertEqual(get_plan.call_args.kwargs["ordered_projection"], ordered_projection)
                         self.assertEqual(torch.are_deterministic_algorithms_enabled(), enabled)
                         self.assertEqual(torch.is_deterministic_algorithms_warn_only_enabled(), warn_only)
                         for output, expected in zip(outputs, inputs, strict=True):
@@ -318,9 +320,9 @@ class TestMegaMhcInvocationState(unittest.TestCase):
         Expectation: Reject ambiguous policies before planning or native execution.
         """
         function = importlib.import_module("hyper_parallel.core.multicore.modules.mega_mhc_grad.function")
-        for value in (1, "true", None):
-            with self.subTest(value=value):
-                with self.assertRaisesRegex(TypeError, "allow_parallel_reduction must be a boolean"):
+        for option in ("allow_parallel_reduction", "ordered_projection"):
+            for value in (1, "true", None):
+                with self.assertRaisesRegex(TypeError, option + " must be a boolean"):
                     function.hyper_mega_mhc_grad(
-                        *_make_gradients(), *_make_inputs(), _make_cache(), allow_parallel_reduction=value,
+                        *_make_gradients(), *_make_inputs(), _make_cache(), **{option: value},
                     )

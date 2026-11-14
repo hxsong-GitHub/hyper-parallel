@@ -407,6 +407,7 @@ def build_mega_mhc_grad_graph(
     *,
     num_vector_cores: int,
     parallel_previous_x: bool = False,
+    ordered_projection: bool = False,
 ) -> tuple[ComputeGraph, TaskSplitValue]:
     """Build the RMS -> PrevAAndMapping -> PhiRms -> PrevXAndPost token pipeline.
 
@@ -417,6 +418,9 @@ def build_mega_mhc_grad_graph(
         num_vector_cores: Physical AIV count reported for the target device.
         parallel_previous_x: Split independent activation-gradient work after a
             single ordered projection tile. Parameter reductions stay unchanged.
+        ordered_projection: Accumulate the projection-weight gradient in one
+            ordered AIC task while retaining independent AIV token tiles. Other
+            parameter gradients still use atomic reductions across those tiles.
 
     Returns:
         Compute graph and its single-rank topology description.
@@ -428,8 +432,14 @@ def build_mega_mhc_grad_graph(
         )
     if not isinstance(parallel_previous_x, bool):
         raise TypeError("parallel_previous_x must be a boolean")
+    if not isinstance(ordered_projection, bool):
+        raise TypeError("ordered_projection must be a boolean")
     token_tile = resolve_grad_token_tile(token_count, token_tile)
     tiling = make_grad_tiling(token_count, token_tile)
+    if ordered_projection:
+        # Every mapping tile must publish its workspace before the single AIC
+        # task consumes tokens in the original 64-row accumulation order.
+        tiling = MegaMhcGradTiling(token_count, token_tile, token_count, tiling.tile_count, 1)
     output_token_tile = token_tile
     if parallel_previous_x and tiling.macro_count == 1:
         # Each final task reads the completed projection workspace and writes a

@@ -62,6 +62,7 @@ def _get_cached_plan(
     token_tile: int,
     *,
     parallel_previous_x: bool = True,
+    ordered_projection: bool = False,
 ) -> MegaMhcGradPlan:
     """Reuse immutable RuntimeConfig tensors for recurring static shapes."""
     return build_mega_mhc_grad_plan(
@@ -72,6 +73,7 @@ def _get_cached_plan(
         num_vector_cores,
         token_tile,
         parallel_previous_x=parallel_previous_x,
+        ordered_projection=ordered_projection,
     )
 
 
@@ -82,6 +84,7 @@ def _get_plan_for_shape(
     token_tile: int,
     *,
     parallel_previous_x: bool = True,
+    ordered_projection: bool = False,
 ) -> MegaMhcGradPlan:
     """Resolve physical cores and retrieve the immutable plan for this shape."""
     device_index = device.index
@@ -97,6 +100,7 @@ def _get_plan_for_shape(
         num_vector_cores,
         token_tile,
         parallel_previous_x=parallel_previous_x,
+        ordered_projection=ordered_projection,
     )
 
 
@@ -160,6 +164,7 @@ def hyper_mega_mhc_grad(
     token_tile: int = DEFAULT_GRAD_TOKEN_TILE,
     parallel_previous_x: bool = True,
     allow_parallel_reduction: bool = False,
+    ordered_projection: bool = False,
 ) -> MegaMhcGradOutputs:
     """Execute the fused Prepare/PhiRms/PrevXPost backward pipeline.
 
@@ -188,6 +193,9 @@ def hyper_mega_mhc_grad(
             reductions even when global deterministic mode is enabled. This keeps
             the requested token tile but does not guarantee bitwise repeatability.
             The default preserves the global deterministic policy.
+        ordered_projection: Use one ordered projection-gradient task even with
+            parallel token tiles. Other parameter reductions remain atomic;
+            this option alone does not guarantee bitwise repeatability.
 
     Returns:
         Gradients for the five block inputs and four trainable tensors.
@@ -196,6 +204,8 @@ def hyper_mega_mhc_grad(
         raise TypeError("parallel_previous_x must be a boolean")
     if not isinstance(allow_parallel_reduction, bool):
         raise TypeError("allow_parallel_reduction must be a boolean")
+    if not isinstance(ordered_projection, bool):
+        raise TypeError("ordered_projection must be a boolean")
     validate_mega_mhc_native_inputs(
         previous_output, residual, previous_pre_mix, previous_post_mix, previous_residual_mix,
         phi, alpha, bias, norm_weight, need_backward=True, token_tile=token_tile,
@@ -214,6 +224,7 @@ def hyper_mega_mhc_grad(
     plan = _get_plan_for_shape(
         token_count, hidden_size, residual.device, token_tile,
         parallel_previous_x=parallel_previous_x,
+        ordered_projection=ordered_projection,
     )
     events = torch.zeros(plan.event_capacity * 4, dtype=torch.uint8, device=residual.device)
     kernel_inputs = (
