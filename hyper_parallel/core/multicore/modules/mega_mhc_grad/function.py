@@ -159,6 +159,7 @@ def hyper_mega_mhc_grad(
     hc_eps: float = 1e-6,
     token_tile: int = DEFAULT_GRAD_TOKEN_TILE,
     parallel_previous_x: bool = True,
+    allow_parallel_reduction: bool = False,
 ) -> MegaMhcGradOutputs:
     """Execute the fused Prepare/PhiRms/PrevXPost backward pipeline.
 
@@ -183,12 +184,18 @@ def hyper_mega_mhc_grad(
             mode overrides this with one full-token tile to order parameter reductions.
         parallel_previous_x: Parallelize the independent final activation-gradient
             stage without changing parameter-gradient accumulation order.
+        allow_parallel_reduction: Explicitly allow atomic parameter-gradient
+            reductions even when global deterministic mode is enabled. This keeps
+            the requested token tile but does not guarantee bitwise repeatability.
+            The default preserves the global deterministic policy.
 
     Returns:
         Gradients for the five block inputs and four trainable tensors.
     """
     if not isinstance(parallel_previous_x, bool):
         raise TypeError("parallel_previous_x must be a boolean")
+    if not isinstance(allow_parallel_reduction, bool):
+        raise TypeError("allow_parallel_reduction must be a boolean")
     validate_mega_mhc_native_inputs(
         previous_output, residual, previous_pre_mix, previous_post_mix, previous_residual_mix,
         phi, alpha, bias, norm_weight, need_backward=True, token_tile=token_tile,
@@ -202,7 +209,7 @@ def hyper_mega_mhc_grad(
     token_count = residual.numel() // (4 * hidden_size)
     # Multiple tasks atomically accumulate shared parameter gradients in scheduling
     # order. A single task removes that source of variation, at a performance cost.
-    if torch.are_deterministic_algorithms_enabled():
+    if torch.are_deterministic_algorithms_enabled() and not allow_parallel_reduction:
         token_tile = token_count
     plan = _get_plan_for_shape(
         token_count, hidden_size, residual.device, token_tile,

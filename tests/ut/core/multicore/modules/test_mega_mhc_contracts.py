@@ -290,13 +290,37 @@ class TestMegaMhcInvocationState(unittest.TestCase):
                 patch.object(torch, "npu", SimpleNamespace(current_device=lambda: 0), create=True),
                 patch.object(function.multicore_ops, "hyper_mega_mhc_grad", return_value=native_outputs),
             ):
-                for enabled, warn_only, expected_tile in ((False, False, 32), (True, False, 40),
-                                                          (True, True, 40), (False, False, 32)):
-                    with self.subTest(enabled=enabled, warn_only=warn_only):
+                cases = ((False, False, False, 32), (True, False, False, 40),
+                         (True, True, False, 40), (True, False, True, 32),
+                         (True, True, True, 32), (False, False, True, 32),
+                         (False, False, False, 32))
+                for enabled, warn_only, allow_parallel, expected_tile in cases:
+                    with self.subTest(enabled=enabled, warn_only=warn_only, allow_parallel=allow_parallel):
                         torch.use_deterministic_algorithms(enabled, warn_only=warn_only)
-                        outputs = function.hyper_mega_mhc_grad(*_make_gradients(), *inputs, cache, token_tile=32)
+                        options = {"allow_parallel_reduction": True} if allow_parallel else {}
+                        outputs = function.hyper_mega_mhc_grad(
+                            *_make_gradients(), *inputs, cache, token_tile=32, **options,
+                        )
                         self.assertEqual(get_plan.call_args.args, (40, 128, 0, 20, 40, expected_tile))
+                        self.assertEqual(torch.are_deterministic_algorithms_enabled(), enabled)
+                        self.assertEqual(torch.is_deterministic_algorithms_warn_only_enabled(), warn_only)
                         for output, expected in zip(outputs, inputs, strict=True):
                             torch.testing.assert_close(output, expected, rtol=0, atol=0)
         finally:
             torch.use_deterministic_algorithms(original_mode, warn_only=original_warn_only)
+
+    @arg_mark(plat_marks=["cpu_linux", "cpu_macos"], level_mark="level0",
+              card_mark="allcards", essential_mark="essential")
+    def test_parallel_reduction_requires_explicit_boolean(self) -> None:
+        """Feature: Explicit reduction-policy override.
+
+        Description: Pass truthy non-boolean values to the public backward API.
+        Expectation: Reject ambiguous policies before planning or native execution.
+        """
+        function = importlib.import_module("hyper_parallel.core.multicore.modules.mega_mhc_grad.function")
+        for value in (1, "true", None):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(TypeError, "allow_parallel_reduction must be a boolean"):
+                    function.hyper_mega_mhc_grad(
+                        *_make_gradients(), *_make_inputs(), _make_cache(), allow_parallel_reduction=value,
+                    )
