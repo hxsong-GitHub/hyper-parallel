@@ -399,6 +399,7 @@ def build_deepseek_v41_validation_config(
         dspark_confidence_coeff: float = 0.1,
         dspark_attention_chunk_size: int = 0,
         dspark_attention_backend: str = "reference",
+        dspark_num_anchors: int = 0,
         dspark_activation_offload: bool = False,
         dspark_offload_pin_memory: bool = True,
         dspark_stage_checkpoint: bool = False,
@@ -436,6 +437,7 @@ def build_deepseek_v41_validation_config(
         dspark_confidence_coeff: Confidence-head BCE weight.
         dspark_attention_chunk_size: DSpark attention query positions per tile, or 0.
         dspark_attention_backend: Reference gather, native ``flash_v3`` or repaired ``sparse_v2`` attention.
+        dspark_num_anchors: Uniformly sampled eligible positions per batch; 0 keeps all positions.
         dspark_activation_offload: Save drafter-stage backward tensors on Host without replaying EP collectives.
         dspark_offload_pin_memory: Use pinned Host storage for drafter activations; False uses pageable memory.
         dspark_stage_checkpoint: Recompute complete DSpark stages, including expert collectives, during backward.
@@ -486,6 +488,9 @@ def build_deepseek_v41_validation_config(
     if dspark_attention_backend not in ("reference", "flash_v3", "sparse_v2"):
         raise ValueError("dspark_attention_backend must be reference, flash_v3 or sparse_v2")
     config.v41_dspark_attention_backend = dspark_attention_backend
+    if not isinstance(dspark_num_anchors, int) or isinstance(dspark_num_anchors, bool) or dspark_num_anchors < 0:
+        raise ValueError("dspark_num_anchors must be a nonnegative integer")
+    config.v41_dspark_num_anchors = dspark_num_anchors
     if not isinstance(dspark_activation_offload, bool):
         raise ValueError("dspark_activation_offload must be a boolean")
     config.v41_dspark_activation_offload = dspark_activation_offload
@@ -552,6 +557,7 @@ def build_cropped_deepseek_v41(
         dspark_offload_pin_memory: bool = True,
         dspark_stage_checkpoint: bool = False,
         dspark_stage_checkpoint_offload: bool = False,
+        dspark_num_anchors: int = 0,
 ) -> PreTrainedModel:
     """Build and parallelize a configurable V4.1 validation crop.
     Args:
@@ -572,6 +578,7 @@ def build_cropped_deepseek_v41(
         dspark_confidence_coeff: Confidence-head BCE weight.
         dspark_attention_chunk_size: DSpark attention query positions per tile, or 0.
         dspark_attention_backend: Reference gather, native ``flash_v3`` or repaired ``sparse_v2`` attention.
+        dspark_num_anchors: Uniformly sampled eligible positions per batch; 0 keeps all positions.
         dspark_activation_offload: Save drafter-stage backward tensors on Host without replaying EP collectives.
         dspark_offload_pin_memory: Use pinned Host storage for drafter activations; False uses pageable memory.
         dspark_stage_checkpoint: Recompute complete DSpark stages, including expert collectives, during backward.
@@ -605,6 +612,7 @@ def build_cropped_deepseek_v41(
         dspark_loss_coeff=dspark_loss_coeff, dspark_confidence_coeff=dspark_confidence_coeff,
         dspark_attention_chunk_size=dspark_attention_chunk_size,
         dspark_attention_backend=dspark_attention_backend,
+        dspark_num_anchors=dspark_num_anchors,
         dspark_activation_offload=dspark_activation_offload,
         dspark_offload_pin_memory=dspark_offload_pin_memory,
         dspark_stage_checkpoint=dspark_stage_checkpoint,

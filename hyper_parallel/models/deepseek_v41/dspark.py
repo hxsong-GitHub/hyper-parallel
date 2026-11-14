@@ -28,8 +28,10 @@ Training contract implemented here, following the report:
   caller; ``main_proj`` consumes the concatenation of the
   ``dspark_target_layer_ids`` backbone hiddens.
 * One forward computes base logits for all ``block_size`` draft offsets of
-  every sequence position (teacher forcing). The Markov head adds a low-rank
-  bias conditioned on the previous ground-truth token of each draft offset.
+  each selected sequence position (teacher forcing). By default every position
+  is selected; an explicit anchor budget enables uniform sampling with inverse
+  inclusion-probability weighting. The Markov head adds a low-rank bias
+  conditioned on the previous ground-truth token of each draft offset.
 * With the main context ending at ``t``, the first draft input is ``x[t+1]``;
   draft offset ``j`` predicts ``x[t+2+j]``. The objective is token-weighted
   cross-entropy and the confidence objective is a BCE against greedy-hit events.
@@ -48,6 +50,7 @@ from __future__ import annotations
 import logging
 import math
 from contextlib import nullcontext
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 
@@ -68,6 +71,51 @@ logger = logging.getLogger(__name__)
 # Draft positions multiply the backbone token count. Bound FP32 mHC
 # intermediates by independent rows without changing a row's reduction order.
 _MHC_ROW_CHUNK = 1024
+
+
+@dataclass(frozen=True)
+class _AnchorSelection:
+    """Host sampling metadata retained across all stages and checkpoint replay."""
+
+    positions: tuple[int, ...]
+    valid_count: int
+    population: int
+
+    @property
+    def weight(self) -> float:
+        """Return the inverse inclusion probability for the supervised loss sum."""
+        return self.population / max(self.valid_count, 1)
+
+
+def _sample_draft_anchors(targets: torch.Tensor, budget: int) -> _AnchorSelection:
+    """Sample shared positions uniformly from the union of eligible batch anchors.
+
+    Eligibility and sampling are established before activation checkpointing.
+    Fixed-size padding preserves the expert-dispatch shape across ranks. The
+    caller masks padded anchors and uses inverse-probability loss weighting.
+    """
+    eligible = (targets != IGNORE_INDEX).any(dim=(0, 2)).cpu().nonzero().flatten()
+    population = eligible.numel()
+    count = min(population, budget)
+    selected = eligible[torch.randperm(population, device="cpu")[:count]].sort().values.tolist()
+    return _AnchorSelection(tuple(selected + [0] * (budget - count)), count, population)
+
+
+def _validate_anchor_budget(budget):
+    """Require an explicit nonnegative integer sampling budget."""
+    if not isinstance(budget, int) or isinstance(budget, bool) or budget < 0:
+        raise ValueError("v41_dspark_num_anchors must be a nonnegative integer")
+    return budget
+
+
+def _validate_draft_anchors(main_length, anchors, positions):
+    """Reject compacted anchors that no longer identify the complete main context."""
+    if positions is None:
+        valid = anchors == main_length
+    else:
+        valid = len(positions) == anchors and all(0 <= index < main_length for index in positions)
+    if not valid:
+        raise ValueError("DSpark draft anchors must identify positions in the complete main context")
 
 
 def _flash_attention_v3(query, key_value, sink, query_lengths, kv_lengths, scale):
@@ -384,6 +432,7 @@ class DSparkDraftAttention(nn.Module):
             rope_sin: torch.Tensor,
             *,
             sequence_boundaries: tuple[int, ...] | None = None,
+            anchor_positions: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
         """Attend each draft block to its main window and all of its draft KV.
 
@@ -393,16 +442,19 @@ class DSparkDraftAttention(nn.Module):
             rope_cos: FP32 ``[1, seq + block, rope_dim / 2]`` cosine table.
             rope_sin: FP32 ``[1, seq + block, rope_dim / 2]`` sine table.
             sequence_boundaries: Optional complete-document boundaries for packed training.
+            anchor_positions: Original main positions of an optional sampled draft batch.
 
         Returns:
             ``[batch, seq, block, hidden]`` attention output.
         """
         seq, block = draft_states.shape[1:3]
-        if rope_cos.shape[1] < seq + block or rope_sin.shape != rope_cos.shape:
+        main_seq = main_states.shape[1]
+        _validate_draft_anchors(main_seq, seq, anchor_positions)
+        if rope_cos.shape[1] < main_seq + block or rope_sin.shape != rope_cos.shape:
             raise ValueError("DSpark rotary tables must cover the main context and every future draft position")
         key_value = self.kv_norm(self.wkv(main_states))
         rope = self.rope_dim
-        positions, _ = _document_geometry(seq, sequence_boundaries)
+        positions, _ = _document_geometry(main_seq, sequence_boundaries)
         main_positions = torch.tensor(positions, device=main_states.device, dtype=torch.long)
         key_value = torch.cat(
             [key_value[..., :-rope], _apply_rope(key_value[..., -rope:],
@@ -410,13 +462,17 @@ class DSparkDraftAttention(nn.Module):
                                                rope_sin.index_select(1, main_positions))],
             dim=-1,
         )
+        if anchor_positions is not None:
+            positions = tuple(positions[index] for index in anchor_positions)
         chunk = self.attention_chunk_size
         if chunk == 0 or seq <= chunk:
-            return self._attend_range(draft_states, key_value, rope_cos, rope_sin, 0, positions)
+            return self._attend_range(draft_states, key_value, rope_cos, rope_sin, 0, positions, anchor_positions)
         outputs = []
         for start in range(0, seq, chunk):
             stop = min(start + chunk, seq)
-            arguments = (draft_states[:, start:stop], key_value, rope_cos, rope_sin, start, positions[start:stop])
+            absolute = None if anchor_positions is None else anchor_positions[start:stop]
+            arguments = (draft_states[:, start:stop], key_value, rope_cos, rope_sin,
+                         start, positions[start:stop], absolute)
             if self.training and torch.is_grad_enabled():
                 outputs.append(_checkpoint(self._attend_range, *arguments))
             else:
@@ -431,6 +487,7 @@ class DSparkDraftAttention(nn.Module):
             rope_sin: torch.Tensor,
             start: int,
             document_positions: tuple[int, ...],
+            anchor_positions: tuple[int, ...] | None = None,
     ) -> torch.Tensor:
         """Run independent decode anchors at their absolute main and future positions."""
         batch, seq, block, _ = draft_states.shape
@@ -449,12 +506,12 @@ class DSparkDraftAttention(nn.Module):
                               _apply_rope(draft_kv[..., -rope:], draft_cos, draft_sin)), dim=-1)
         if self.attention_backend == "sparse_v2":
             context = dspark_sparse_attention(query, key_value, draft_kv, self.attn_sink.to(query.dtype).float(),
-                                               self.window, start, document_positions)
+                                               self.window, start, document_positions, anchor_positions)
             if not self._sparse_engaged:
                 logger.info("DSpark native sparse_v2 training attention engaged with valid-prefix selected KV")
                 self._sparse_engaged = True
         else:
-            combined_kv, valid = self._gather_context(key_value, draft_kv, start, local_positions)
+            combined_kv, valid = self._gather_context(key_value, draft_kv, start, local_positions, anchor_positions)
             if self.attention_backend == "flash_v3":
                 context = self._flash_window_context(query, combined_kv, document_positions)
             else:
@@ -466,10 +523,11 @@ class DSparkDraftAttention(nn.Module):
         reduced = torch.einsum("bsjgd,grd->bsjgr", grouped, wo_a.to(context.dtype))
         return self.wo_b(reduced.flatten(3))
 
-    def _gather_context(self, main_kv, draft_kv, start, local_positions):
+    def _gather_context(self, main_kv, draft_kv, start, local_positions, anchor_positions=None):
         """Gather bounded main windows on the device and append all draft keys/values."""
         batch, seq, block, dim = draft_kv.shape
-        positions = torch.arange(start, start + seq, device=main_kv.device)
+        positions = (torch.arange(start, start + seq, device=main_kv.device) if anchor_positions is None
+                     else torch.tensor(anchor_positions, device=main_kv.device))
         backwards = torch.arange(self.window - 1, -1, -1, device=main_kv.device)
         indices = positions[:, None] - backwards[None, :]
         document_starts = positions - local_positions
@@ -542,6 +600,7 @@ class DSparkStage(nn.Module):
             rope_cos: torch.Tensor,
             rope_sin: torch.Tensor,
             sequence_boundaries: tuple[int, ...] | None,
+            anchor_positions: tuple[int, ...] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run the communication-free stage prefix up to the FFN input.
 
@@ -557,6 +616,7 @@ class DSparkStage(nn.Module):
             rope_cos: Rotary cosine table.
             rope_sin: Rotary sine table.
             sequence_boundaries: Complete-document boundaries of the packed training input.
+            anchor_positions: Original main positions of an optional sampled draft batch.
 
         Returns:
             Post-attention flat stream, FFN input, and the mHC pre/post/
@@ -571,7 +631,7 @@ class DSparkStage(nn.Module):
         collapsed = _collapse_streams(flat, pre_mix)
         attn_input = self.input_layernorm(collapsed).view(batch, seq, block, hidden)
         attn_output = self.self_attn(attn_input, main_states, rope_cos, rope_sin,
-                                    sequence_boundaries=sequence_boundaries)
+                                    sequence_boundaries=sequence_boundaries, anchor_positions=anchor_positions)
         flat = pipelined_mhc_post(attn_output.reshape(batch, seq * block, hidden), residual, attn_post, attn_comb)
         ffn_pre, ffn_post, ffn_comb = self.ffn_hc(flat)
         collapsed = _collapse_streams(flat, attn_pre)
@@ -588,6 +648,7 @@ class DSparkStage(nn.Module):
             input_ids: torch.Tensor,
             use_checkpoint: bool = False,
             sequence_boundaries: tuple[int, ...] | None = None,
+            anchor_positions: tuple[int, ...] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run one DSpark stage over the flattened draft stream.
 
@@ -601,6 +662,7 @@ class DSparkStage(nn.Module):
             use_checkpoint: Recompute the communication-free prefix in
                 backward instead of storing its activations.
             sequence_boundaries: Complete-document boundaries of the packed training input.
+            anchor_positions: Original main positions of an optional sampled draft batch.
 
         Returns:
             Updated hidden streams and the FFN-half pre-mix coefficients.
@@ -620,10 +682,10 @@ class DSparkStage(nn.Module):
             if use_checkpoint:
                 flat, ffn_input, ffn_pre, ffn_post, ffn_comb = _checkpoint(
                     self._pre_ffn, hidden_streams, pre_mix, main_states,
-                    rope_cos, rope_sin, sequence_boundaries)
+                    rope_cos, rope_sin, sequence_boundaries, anchor_positions)
             else:
                 flat, ffn_input, ffn_pre, ffn_post, ffn_comb = self._pre_ffn(
-                    hidden_streams, pre_mix, main_states, rope_cos, rope_sin, sequence_boundaries)
+                    hidden_streams, pre_mix, main_states, rope_cos, rope_sin, sequence_boundaries, anchor_positions)
             ffn_output = self.mlp(ffn_input, input_ids=input_ids)
             flat = pipelined_mhc_post(ffn_output, flat, ffn_post, ffn_comb)
             return flat.view(batch, seq, block, streams, hidden), ffn_pre
@@ -711,6 +773,8 @@ class DeepseekV41DSpark(nn.Module):
         # lower the vocabulary-logits peak at the cost of more recompute
         # rounds; the loss value itself is chunking-invariant.
         self.loss_chunk_size = int(getattr(config, "v41_dspark_loss_chunk_size", 64) or 64)
+        self.anchor_budget = _validate_anchor_budget(getattr(config, "v41_dspark_num_anchors", 0))
+        self.last_anchor_selection = None
         self.stage_checkpoint = getattr(config, "v41_dspark_stage_checkpoint", False)
         if not isinstance(self.stage_checkpoint, bool):
             raise ValueError("v41_dspark_stage_checkpoint must be a boolean")
@@ -874,6 +938,10 @@ class DeepseekV41DSpark(nn.Module):
         if token_mask is not None and (token_mask.shape != input_ids.shape or token_mask.dtype != torch.bool):
             raise ValueError("DSpark token_mask must be a boolean mask matching input_ids")
         _, document_ends = _document_geometry(seq, sequence_boundaries)
+        markov_inputs, targets, full_supervised, selection, anchor_indices = self._select_anchor_targets(
+            input_ids, labels, token_mask, sequence_boundaries)
+        anchor_positions = None if selection is None else selection.positions
+        anchors = anchor_indices.numel()
         main_states = self.main_norm(self.main_proj(torch.cat(target_hiddens, dim=-1)))
 
         # Tied-but-frozen backbone surfaces: the drafter reuses the backbone
@@ -882,42 +950,35 @@ class DeepseekV41DSpark(nn.Module):
         # gradients from reaching the backbone.
         token_embeddings = inputs_embeds
         noise = noise_embedding.to(token_embeddings.dtype)
-        draft = torch.empty(batch, seq, block, token_embeddings.shape[-1],
+        draft = torch.empty(batch, anchors, block, token_embeddings.shape[-1],
                             dtype=token_embeddings.dtype, device=device)
         first_embeddings = torch.cat((token_embeddings[:, 1:], noise.expand(batch, 1, -1)), dim=1)
-        next_is_in_document = (torch.arange(seq, device=device) + 1
-                               < torch.tensor(document_ends, device=device))
+        if selection is not None:
+            first_embeddings = first_embeddings.index_select(1, anchor_indices)
+        next_is_in_document = (anchor_indices + 1
+                               < torch.tensor(document_ends, device=device).index_select(0, anchor_indices))
         draft[:, :, 0] = torch.where(next_is_in_document[None, :, None], first_embeddings, noise)
         draft[:, :, 1:] = noise
         streams = draft.unsqueeze(3).expand(-1, -1, -1, self.hc_mult, -1).contiguous()
         # The expanded stream owns its storage. Release construction buffers
         # before the stage workspace and residual outputs reach their peak.
         del draft, first_embeddings
-        pre_mix = streams.new_zeros(batch, seq * block, self.hc_mult, dtype=torch.float32)
+        pre_mix = streams.new_zeros(batch, anchors * block, self.hc_mult, dtype=torch.float32)
         pre_mix[:, :, 0] = 1.0
         rope_cos, rope_sin = self._rope_tables(seq, device, token_embeddings.dtype)
-        draft_ids = input_ids.new_full((batch, seq, block), self.noise_token_id)
+        draft_ids = input_ids.new_full((batch, anchors, block), self.noise_token_id)
         first_ids = functional.pad(input_ids[:, 1:], (0, 1), value=self.noise_token_id)
+        if selection is not None:
+            first_ids = first_ids.index_select(1, anchor_indices)
         draft_ids[:, :, 0] = torch.where(next_is_in_document, first_ids, self.noise_token_id)
-        draft_ids = draft_ids.reshape(batch, seq * block)
+        draft_ids = draft_ids.reshape(batch, anchors * block)
         # The flattened draft stream (seq x block positions, hc streams) makes
         # stage activations the dominant memory term. The default checkpoints
         # only the communication-free prefix; full-stage replay also trades
         # extra expert communication for a smaller saved-activation footprint.
         gradient_active = torch.is_grad_enabled() and self.training
-        for stage in self.stages:
-            if self.stage_checkpoint and gradient_active:
-                streams, pre_mix = _checkpoint_stage(
-                    stage, streams, pre_mix, main_states, rope_cos, rope_sin, draft_ids,
-                    offload_inputs=self.stage_checkpoint_offload,
-                    # Retain the local prefix checkpoint during stage replay:
-                    # otherwise its saved activations overlap the expert workspace.
-                    use_checkpoint=True, sequence_boundaries=sequence_boundaries,
-                )
-            else:
-                streams, pre_mix = stage(streams, pre_mix, main_states, rope_cos,
-                                         rope_sin, draft_ids, use_checkpoint=gradient_active,
-                                         sequence_boundaries=sequence_boundaries)
+        streams, pre_mix = self._run_stages(streams, pre_mix, main_states, (rope_cos, rope_sin),
+                                             draft_ids, sequence_boundaries, anchor_positions)
         def _collapse(streams_in: torch.Tensor, pre_mix_in: torch.Tensor) -> torch.Tensor:
             return _collapse_streams(streams_in, pre_mix_in)
 
@@ -927,9 +988,6 @@ class DeepseekV41DSpark(nn.Module):
             hidden_out = _checkpoint(_collapse, streams, pre_mix)
         else:
             hidden_out = _collapse(streams, pre_mix)
-
-        markov_inputs, targets = self._teacher_forced_targets(
-            input_ids, labels, token_mask, sequence_boundaries)
 
         # Sequence-chunked objective: the [batch, seq, block, vocab] draft
         # logits are never materialized whole.  Each chunk recomputes its
@@ -969,8 +1027,8 @@ class DeepseekV41DSpark(nn.Module):
         ce_total = hidden_out.new_zeros((), dtype=torch.float32)
         bce_total = hidden_out.new_zeros((), dtype=torch.float32)
         hit_total = hidden_out.new_zeros((), dtype=torch.float32)
-        for start in range(0, seq, chunk):
-            stop = min(start + chunk, seq)
+        for start in range(0, anchors, chunk):
+            stop = min(start + chunk, anchors)
             ce_sum, bce_sum, hit_sum = _checkpoint(
                 _chunk_objective,
                 hidden_out[:, start:stop],
@@ -981,18 +1039,58 @@ class DeepseekV41DSpark(nn.Module):
             bce_total = bce_total + bce_sum
             hit_total = hit_total + hit_sum
         supervised = (targets != IGNORE_INDEX).sum()
-        denominator = supervised.clamp(min=1).float()
-        draft_ce = ce_total / denominator
-        confidence_bce = bce_total / denominator
+        denominator = full_supervised.clamp(min=1).float()
+        weight = 1.0 if selection is None else selection.weight
+        draft_ce = ce_total * weight / denominator
+        confidence_bce = bce_total * weight / denominator
         loss = draft_ce + self.confidence_coeff * confidence_bce
-        accuracy = (hit_total / denominator).detach()
+        accuracy = (hit_total / supervised.clamp(min=1)).detach()
         metrics = {
             "dspark_ce": draft_ce.detach(),
             "dspark_confidence_bce": confidence_bce.detach(),
             "dspark_draft_accuracy": accuracy,
             "dspark_supervised_tokens": supervised.detach(),
         }
+        if selection is not None:
+            metrics["dspark_full_supervised_tokens"] = full_supervised.detach()
+            metrics["dspark_sampled_anchors"] = torch.tensor(selection.valid_count, device=device)
+            metrics["dspark_population_anchors"] = torch.tensor(selection.population, device=device)
         return loss, metrics
+
+    def _select_anchor_targets(self, input_ids, labels, token_mask, sequence_boundaries):
+        """Select objectives once, before any stage activation-checkpoint replay."""
+        markov, targets = self._teacher_forced_targets(input_ids, labels, token_mask, sequence_boundaries)
+        full_supervised = (targets != IGNORE_INDEX).sum()
+        sequence = input_ids.shape[1]
+        selection = (_sample_draft_anchors(targets, self.anchor_budget)
+                     if 0 < self.anchor_budget < sequence else None)
+        self.last_anchor_selection = selection
+        indices = (torch.arange(sequence, device=input_ids.device) if selection is None
+                   else torch.tensor(selection.positions, device=input_ids.device))
+        if selection is not None:
+            markov = markov.index_select(1, indices)
+            targets = targets.index_select(1, indices)
+            targets[:, selection.valid_count:] = IGNORE_INDEX
+        return markov, targets, full_supervised, selection, indices
+
+    def _run_stages(self, streams, pre_mix, main_states, rope_tables, draft_ids,
+                    sequence_boundaries, anchor_positions):
+        """Retain the same selected positions through all stages and recomputation."""
+        gradient_active = torch.is_grad_enabled() and self.training
+        for stage in self.stages:
+            if self.stage_checkpoint and gradient_active:
+                # Retain the local prefix checkpoint during stage replay;
+                # otherwise its saved activations overlap the expert workspace.
+                streams, pre_mix = _checkpoint_stage(
+                    stage, streams, pre_mix, main_states, *rope_tables, draft_ids,
+                    offload_inputs=self.stage_checkpoint_offload, use_checkpoint=True,
+                    sequence_boundaries=sequence_boundaries, anchor_positions=anchor_positions,
+                )
+            else:
+                streams, pre_mix = stage(streams, pre_mix, main_states, *rope_tables, draft_ids,
+                                         use_checkpoint=gradient_active, sequence_boundaries=sequence_boundaries,
+                                         anchor_positions=anchor_positions)
+        return streams, pre_mix
 
 
 __all__ = [
