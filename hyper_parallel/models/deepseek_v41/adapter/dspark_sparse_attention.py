@@ -30,11 +30,11 @@ import torch
 
 @lru_cache(maxsize=8)
 def _sparse_draft_metadata(batch, main_length, block, window, start, document_positions, device,
-                           anchor_positions=None):
+                           anchor_positions=None, include_sink=False):
     """Keep each query's valid main and draft indices before its padding suffix."""
     anchors = len(document_positions)
     absolute = tuple(range(start, start + anchors)) if anchor_positions is None else anchor_positions
-    if (batch <= 0 or anchors == 0 or block <= 0 or window <= 0 or window + block > 1024
+    if (batch <= 0 or anchors == 0 or block <= 0 or window <= 0 or window + block + int(include_sink) > 1024
             or len(absolute) != anchors or any(index < 0 or index >= main_length for index in absolute)
             or any(position < 0 or position > index
                    for index, position in zip(absolute, document_positions, strict=True))):
@@ -50,7 +50,33 @@ def _sparse_draft_metadata(batch, main_length, block, window, start, document_po
     draft_indices = batch * main_length + (batch_indices * anchors + anchor_indices) * block + columns - counts
     selected = torch.where(columns < counts, main_indices, draft_indices)
     selected = selected.masked_fill(columns >= counts + block, -1)
+    if include_sink:
+        sink_index = batch * main_length + batch * anchors * block
+        selected = torch.where(columns == counts + block, sink_index, selected)
     return selected.repeat_interleave(block, dim=1).reshape(-1, 1, 1024).to(device)
+
+
+@lru_cache(maxsize=8)
+def _sink_key_components(width, dtype):
+    """Represent the inverse scale with three mantissas, computed once on Host."""
+    inverse_scale = width ** 0.5
+    residual, components = inverse_scale, []
+    for _ in range(3):
+        component = torch.tensor(residual, dtype=dtype, device="cpu").item()
+        components.append(component)
+        residual -= component
+    return tuple(components), sum(components) / inverse_scale
+
+
+def _sink_rotary_operands(query, bank, sink):
+    """Encode a zero-valued virtual key whose scaled logit is the learned sink."""
+    components, factor = _sink_key_components(query.shape[-1], query.dtype)
+    query_rope = query.new_zeros((*query.shape[:-1], 64))
+    key_rope = bank.new_zeros((*bank.shape[:-1], 64))
+    query_rope[..., :len(components)] = sink.to(query.dtype)[None, :, None]
+    for index, component in enumerate(components):
+        key_rope[-1, :, index] = component
+    return query_rope, key_rope, factor
 
 
 class _SparseSinkAttention(torch.autograd.Function):
@@ -59,13 +85,13 @@ class _SparseSinkAttention(torch.autograd.Function):
     @staticmethod
     def forward(ctx: Any, query: torch.Tensor, bank: torch.Tensor,
                 indices: torch.Tensor, sink: torch.Tensor) -> torch.Tensor:
-        """Apply sparse attention and the learned per-head sink normalizer.
+        """Include the learned per-head sink in the native softmax.
 
         Args:
             ctx: Autograd context retaining native backward inputs.
             query: Rotated BF16 queries in TND layout.
             bank: Shared main and draft KV rows.
-            indices: Valid selected indices followed by negative padding.
+            indices: Valid KV indices, one virtual sink index, then negative padding.
             sink: Per-head FP32 sink logits.
 
         Returns:
@@ -74,26 +100,24 @@ class _SparseSinkAttention(torch.autograd.Function):
         # These runtime dependencies must stay optional on CPU-only hosts.
         import torch_npu  # pylint: disable=import-outside-toplevel
 
+        bank = torch.cat((bank, bank.new_zeros(1, *bank.shape[1:])), dim=0)
         qlen = torch.tensor([query.shape[0]], dtype=torch.int32, device=query.device)
         klen = torch.tensor([bank.shape[0]], dtype=torch.int32, device=query.device)
-        # A3's selected-KV kernel requires the separate rotary operand. The
-        # real DSpark rotary coordinates are already inside query and bank.
-        qrope = query.new_zeros((*query.shape[:-1], 64))
-        krope = bank.new_zeros((*bank.shape[:-1], 64))
-        value, maximum, denominator = torch_npu.npu_sparse_flash_attention(
+        # A3 does not support the native sinks argument. An auxiliary rotary
+        # operand puts the scalar sink inside softmax without another BF16
+        # output cast. The real DSpark rotary coordinates remain unchanged.
+        qrope, krope, factor = _sink_rotary_operands(query, bank, sink)
+        output, maximum, denominator = torch_npu.npu_sparse_flash_attention(
             query, bank, bank, indices, query.shape[-1] ** -0.5,
             actual_seq_lengths_query=qlen, actual_seq_lengths_kv=klen,
             sparse_block_size=1, layout_query="TND", layout_kv="TND", sparse_mode=0,
             attention_mode=2, return_softmax_lse=True, sinks=None, query_rope=qrope, key_rope=krope,
         )
         row_max, row_sum = maximum.reshape(query.shape[:2]), denominator.reshape(query.shape[:2])
-        total_max = torch.maximum(row_max, sink[None, :])
-        selected_sum = row_sum * torch.exp(row_max - total_max)
-        total_sum = selected_sum + torch.exp(sink[None, :] - total_max)
-        alpha = selected_sum / total_sum
-        output = (value.float() * alpha.unsqueeze(-1)).to(query.dtype)
-        ctx.save_for_backward(query, bank, indices, output, total_max.reshape_as(maximum).contiguous(),
-                              total_sum.reshape_as(denominator).contiguous(), alpha, qlen, klen, qrope, krope)
+        sink_probability = torch.exp(sink[None, :] * factor - row_max) / row_sum
+        ctx.sink_factor = factor
+        ctx.save_for_backward(query, bank, indices, output, maximum, denominator,
+                              sink_probability, qlen, klen, qrope, krope)
         return output
 
     @staticmethod
@@ -110,7 +134,7 @@ class _SparseSinkAttention(torch.autograd.Function):
         # The repaired custom operator is required; no fallback changes its semantics.
         import cann_ops_transformer as ops  # pylint: disable=import-outside-toplevel
 
-        query, bank, indices, output, maximum, denominator, alpha, qlen, klen, qrope, krope = ctx.saved_tensors
+        query, bank, indices, output, maximum, denominator, probability, qlen, klen, qrope, krope = ctx.saved_tensors
         dq, dkv, dv, _, _, _ = ops.sparse_flash_attention_grad(
             query, bank, None, indices, gradient.contiguous(), output, maximum, denominator,
             sinks=None, scale_value=query.shape[-1] ** -0.5, sparse_block_size=1,
@@ -119,8 +143,10 @@ class _SparseSinkAttention(torch.autograd.Function):
         )
         if dv.numel() != 0:
             raise RuntimeError("DSpark shared-KV backward must return one combined KV derivative")
-        dsink = -((gradient.float() * output.float()).sum(-1) * (1 - alpha)).sum(0)
-        return dq, dkv, None, dsink
+        accumulation_dtype = torch.float64 if query.dtype == torch.float64 else torch.float32
+        product = (gradient.to(accumulation_dtype) * output.to(accumulation_dtype)).sum(-1)
+        dsink = -(product * probability).sum(0) * ctx.sink_factor
+        return dq, dkv[:-1], None, dsink
 
 
 def dspark_sparse_attention(query: torch.Tensor, main_kv: torch.Tensor, draft_kv: torch.Tensor,
@@ -150,7 +176,7 @@ def dspark_sparse_attention(query: torch.Tensor, main_kv: torch.Tensor, draft_kv
             or len(document_positions) != anchors):
         raise ValueError("DSpark sparse KV and document metadata must match the query chunk")
     indices = _sparse_draft_metadata(batch, main_kv.shape[1], block, window, start,
-                                     document_positions, query.device, anchor_positions)
+                                     document_positions, query.device, anchor_positions, include_sink=True)
     bank = torch.cat((main_kv.reshape(-1, width), draft_kv.reshape(-1, width)), dim=0)
     bank = bank.unsqueeze(1).to(query.dtype).contiguous()
     output = _SparseSinkAttention.apply(query.reshape(-1, heads, width).contiguous(), bank, indices, sink)
