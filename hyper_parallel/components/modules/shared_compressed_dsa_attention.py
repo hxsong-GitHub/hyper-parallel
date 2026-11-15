@@ -1757,7 +1757,7 @@ class _NativeGroupedOutputProjection(torch.autograd.Function):
         if ctx.needs_input_grad[0]:
             input_gradient = torch.bmm(grouped_gradient, weight).transpose(0, 1)
         if ctx.needs_input_grad[1]:
-            weight_gradient = torch.bmm(grouped.permute(1, 2, 0), grouped_gradient).transpose(1, 2)
+            weight_gradient = torch.bmm(grouped_gradient.transpose(1, 2), grouped.transpose(0, 1))
         return input_gradient, weight_gradient
 
 
