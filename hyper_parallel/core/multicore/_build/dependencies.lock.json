@@ -111,6 +111,10 @@
             "path": "hyper_parallel/core/multicore/ops/mhc_post_backward_scalar_mix.patch",
             "sha256": "9e18b7142c41644c5e223e80fa755491b646b19743a356e82bbe120d7e5bca46",
             "purpose": "reuse post-gradient vector scratch and bound the channel tile footprint"
+          },
+          {
+            "path": "hyper_parallel/core/multicore/ops/mhc_post_backward_fuse_pre_gradient.patch",
+            "sha256": "60df596d7cf58e4d8a87633fd4c7c4cc87f4dea9afcbb9a4ff36047f3042e1b0"
           }
         ],
         "upgrade_policy": "a version change must pass HyperMegaMhc accuracy and performance validation"

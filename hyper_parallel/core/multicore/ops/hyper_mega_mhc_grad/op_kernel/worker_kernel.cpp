@@ -66,6 +66,7 @@ __aicore__ inline TokenTile ResolveTokenTile(const TaskDesc &taskDesc,
 }
 
 struct WorkspaceAddresses {
+  GM_ADDR gradXCube;
   GM_ADDR gradHin;
   GM_ADDR gradXFromPre;
   GM_ADDR gradRsqrt;
@@ -75,10 +76,11 @@ __aicore__ inline WorkspaceAddresses ResolveWorkspace(GM_ADDR workspace,
                                                       const MhcPreSinkhornBackwardArch22TilingData *tiling) {
   int64_t tokens = tiling->batchSize * tiling->seqLength;
   int64_t hcMix = tiling->n * tiling->n + 2 * tiling->n;
+  const int64_t projectionBufferBytes = tokens * tiling->n * tiling->c * sizeof(float);
   int64_t offset = tokens * hcMix * sizeof(float);
-  offset += 2 * tokens * tiling->n * tiling->c * sizeof(float);
-  offset = AlignWorkspace(offset);
   WorkspaceAddresses addresses;
+  addresses.gradXCube = workspace + offset + projectionBufferBytes;
+  offset = AlignWorkspace(offset + 2 * projectionBufferBytes);
   addresses.gradHin = workspace + offset;
   offset += AlignWorkspace(tokens * tiling->c * sizeof(DTYPE_X));
   addresses.gradXFromPre = workspace + offset;
@@ -333,18 +335,24 @@ class KernelWorker
       WorkspaceAddresses addresses = ResolveWorkspace(input_list[WORKSPACE_IDX], tiling);
       TPipe pipe;
 
-      MhcPreGradKernel<DTYPE_X, DTYPE_PHI, false> preGrad;
-      InitMhcPreGradTask(preGrad, pipe, tiling, addresses);
-      preGrad.ProcessGradPreviousXTask(tile.offset, tile.count);
-
-      SynchronizeMte3ToMte2();
-      pipe.Reset();
-
       MhcPostBackwardTilingDataArch22 postTiling = MakePostGradTiling(tiling);
+      const bool fusePreGradient = postTiling.blockChannel > DEFAULT_POST_GRAD_CHANNEL_TILE;
+      if (!fusePreGradient) {
+        MhcPreGradKernel<DTYPE_X, DTYPE_PHI, false> preGrad;
+        InitMhcPreGradTask(preGrad, pipe, tiling, addresses);
+        preGrad.ProcessGradPreviousXTask(tile.offset, tile.count);
+        SynchronizeMte3ToMte2();
+        pipe.Reset();
+      }
+
       KernelMhcPostBackward<DTYPE_X> postGrad;
       postGrad.InitAddTask(addresses.gradXFromPre, input_list[16], input_list[17], input_list[20], input_list[18],
                            input_list[19], input_list[24], input_list[31], input_list[28], input_list[30], postTiling,
                            &pipe, tile.offset, tile.count);
+      if (fusePreGradient) {
+        postGrad.EnablePreGradient(input_list[3], addresses.gradHin, addresses.gradXCube,
+                                   input_list[7], addresses.gradRsqrt, &pipe);
+      }
       postGrad.Process();
       pipe.Destroy();
     }
