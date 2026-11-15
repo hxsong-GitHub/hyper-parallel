@@ -22,33 +22,34 @@ import triton.language as tl
 
 @triton.jit
 def _partial_rope_kernel(
-        source, destination, cosine, sine, rows: tl.constexpr, block: tl.constexpr,
-        backward: tl.constexpr,
+        source, destination, cosine, sine, tokens: tl.constexpr, backward: tl.constexpr,
 ):
-    rotary_lane = tl.arange(0, 64)
-    partner_index = tl.broadcast_to((rotary_lane ^ 1)[None, :], (block, 64))
-    odd_lane = (rotary_lane[None, :] & 1) != 0
-    channel = tl.arange(0, 512)
-    for tile in range(tl.program_id(0), triton.cdiv(rows, block), tl.num_programs(0)):
-        row = tile * block + tl.arange(0, block)
-        row_base = row[:, None] * 512
-        valid = row[:, None] < rows
-        rotary_offset = row_base + 448 + rotary_lane[None, :]
-        table_offset = (row[:, None] // 64) * 64 + rotary_lane[None, :]
-        cos_value = tl.load(cosine + table_offset, valid, other=0).to(tl.float32)
-        sin_value = tl.load(sine + table_offset, valid, other=0).to(tl.float32)
-        value = tl.load(source + rotary_offset, valid, other=0).to(tl.float32)
-        partner = tl.gather(value, partner_index, axis=1)
+    head = tl.arange(0, 64)
+    lane = tl.arange(0, 64)
+    odd_lane = lane[None, None, :] % 2 == 1
+    prefix = tl.arange(0, 512)
+    partner_index = tl.broadcast_to((lane ^ 1)[None, None, :], (1, 64, 64))
+    # Each token's 64 heads share one table row. Load that row once per tile.
+    for tile in range(tl.program_id(0), tokens, tl.num_programs(0)):
+        token = tile + tl.arange(0, 1)
+        valid = token < tokens
+        table_offset = token[:, None] * 64 + lane[None, :]
+        cos_value = tl.load(cosine + table_offset, valid[:, None], other=0).to(tl.float32)
+        sin_value = tl.load(sine + table_offset, valid[:, None], other=0).to(tl.float32)
+        row_base = (token[:, None, None] * 64 + head[None, :, None]) * 512
+        rotary_offset = row_base + 448 + lane[None, None, :]
+        value = tl.load(source + rotary_offset, valid[:, None, None], other=0).to(tl.float32)
+        partner = tl.gather(value, partner_index, axis=2)
         if backward:
             # Match the two BF16 roundings before adding the two gradient contributions.
-            direct = (value * cos_value).to(tl.bfloat16).to(tl.float32)
-            crossed = (partner * sin_value).to(tl.bfloat16).to(tl.float32)
+            direct = (value * cos_value[:, None, :]).to(tl.bfloat16).to(tl.float32)
+            crossed = (partner * sin_value[:, None, :]).to(tl.bfloat16).to(tl.float32)
             rotary = direct + tl.where(odd_lane, -crossed, crossed)
         else:
-            rotary = value * cos_value + tl.where(odd_lane, partner, -partner) * sin_value
-        tl.store(destination + rotary_offset, rotary, valid)
-        prefix_offset = row_base + channel[None, :]
-        prefix_valid = valid & (channel[None, :] < 448)
+            rotary = value * cos_value[:, None, :] + tl.where(odd_lane, partner, -partner) * sin_value[:, None, :]
+        tl.store(destination + rotary_offset, rotary, valid[:, None, None])
+        prefix_offset = row_base + prefix[None, None, :]
+        prefix_valid = valid[:, None, None] & (prefix[None, None, :] < 448)
         prefix_value = tl.load(source + prefix_offset, prefix_valid, other=0)
         tl.store(destination + prefix_offset, prefix_value, prefix_valid)
 
@@ -56,7 +57,7 @@ def _partial_rope_kernel(
 def _run_partial_rope(value: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor, *, backward: bool) -> torch.Tensor:
     output = torch.empty_like(value)
     _partial_rope_kernel[(48,)](
-        value, output, cos, sin, value.shape[1] * 64, 32, backward, enable_fp_fusion=False,
+        value, output, cos, sin, value.shape[1], backward, enable_fp_fusion=False,
     )
     return output
 
