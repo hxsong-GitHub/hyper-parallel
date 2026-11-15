@@ -59,6 +59,7 @@ from torch import nn  # pylint: disable=forbidden-backend-import
 from torch.nn import functional  # pylint: disable=forbidden-backend-import
 
 from hyper_parallel.components.functional.sinkhorn import sinkhorn_knopps
+from hyper_parallel.core.activation_memory.cpu_offload import PageableSaveOnCpu
 from hyper_parallel.core.activation_memory.recompute_state import create_recompute_contexts
 from hyper_parallel.core.dtensor.dtensor import DTensor, distribute_tensor
 from hyper_parallel.core.dtensor.placement_types import Replicate
@@ -159,8 +160,7 @@ def _checkpoint_stage(function, *args, offload_inputs=False, **kwargs):
     # Every rank must execute the complete collective sequence during replay.
     # The outer hook moves only checkpoint inputs; the inner checkpoint hook
     # discards intermediate activations instead of copying them to Host.
-    storage = (torch.autograd.graph.save_on_cpu(pin_memory=False, device_type=device.type)
-               if offload_inputs else nullcontext())
+    storage = PageableSaveOnCpu() if offload_inputs else nullcontext()
     with storage, torch.utils.checkpoint.set_checkpoint_early_stop(False):
         return torch.utils.checkpoint.checkpoint(
             function, *args, **kwargs, use_reentrant=False, context_fn=create_recompute_contexts,
@@ -674,10 +674,12 @@ class DSparkStage(nn.Module):
         # Store backward tensors on Host without replaying EP collectives. The
         # existing local checkpoints still bound temporary activations; their
         # saved inputs now release device storage between draft stages.
-        storage = (torch.autograd.graph.save_on_cpu(
-            pin_memory=self.offload_pin_memory and hidden_streams.device.type != "cpu",
-            device_type=hidden_streams.device.type,
-        ) if offload else nullcontext())
+        storage = nullcontext()
+        if offload:
+            if self.offload_pin_memory and hidden_streams.device.type != "cpu":
+                storage = torch.autograd.graph.save_on_cpu(pin_memory=True, device_type=hidden_streams.device.type)
+            else:
+                storage = PageableSaveOnCpu()
         with storage:
             if use_checkpoint:
                 flat, ffn_input, ffn_pre, ffn_post, ffn_comb = _checkpoint(
