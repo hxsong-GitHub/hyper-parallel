@@ -6,6 +6,7 @@
 /*! \file worker_kernel.cpp */
 #include "kernel_operator.h"
 #include "hyper_mega_mhc_grad_task_tiling.h"
+#include "hyper_mega_mhc_grad_workspace.h"
 #include "mhc_post_backward/mhc_post_backward_arch22.h"
 #include "mhc_pre_sinkhorn_backward/arch22/mhc_pre_grad_kernel.h"
 #define ZERO HP_RMS_NORM_GRAD_ZERO
@@ -45,6 +46,11 @@ __aicore__ inline int64_t AlignWorkspace(int64_t value) {
 
 __aicore__ inline int64_t MinValue(int64_t lhs, int64_t rhs) { return lhs < rhs ? lhs : rhs; }
 
+__aicore__ inline bool FusePreGradient(const MhcPreSinkhornBackwardArch22TilingData *tiling) {
+  return tiling->n == HyperMegaMhcGradWorkspace::FUSED_STREAMS &&
+         tiling->c == HyperMegaMhcGradWorkspace::FUSED_HIDDEN_SIZE;
+}
+
 __aicore__ inline void SynchronizeMte3ToMte2() {
   event_t eventMte3Mte2 = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_MTE2));
   SetFlag<HardEvent::MTE3_MTE2>(eventMte3Mte2);
@@ -83,8 +89,11 @@ __aicore__ inline WorkspaceAddresses ResolveWorkspace(GM_ADDR workspace,
   offset = AlignWorkspace(offset + 2 * projectionBufferBytes);
   addresses.gradHin = workspace + offset;
   offset += AlignWorkspace(tokens * tiling->c * sizeof(DTYPE_X));
+  // The fused post gradient consumes pre-gradient tiles directly in UB.
   addresses.gradXFromPre = workspace + offset;
-  offset += AlignWorkspace(tokens * tiling->n * tiling->c * sizeof(DTYPE_X));
+  if (!FusePreGradient(tiling)) {
+    offset += AlignWorkspace(tokens * tiling->n * tiling->c * sizeof(DTYPE_X));
+  }
   addresses.gradRsqrt = workspace + offset;
   return addresses;
 }
@@ -124,9 +133,7 @@ __aicore__ inline MhcPostBackwardTilingDataArch22 MakePostGradTiling(
   uint64_t tokens = tiling->batchSize * tiling->seqLength;
   // Four streams of two-byte activations need 100 bytes per channel after
   // dropping the mix-coefficient broadcast scratch. Keep each tile below UB capacity.
-  const uint64_t channelLimit = tiling->c == 5120 && tiling->n == 4 && sizeof(DTYPE_X) == 2
-                                    ? WIDE_POST_GRAD_CHANNEL_TILE
-                                    : DEFAULT_POST_GRAD_CHANNEL_TILE;
+  const uint64_t channelLimit = FusePreGradient(tiling) ? WIDE_POST_GRAD_CHANNEL_TILE : DEFAULT_POST_GRAD_CHANNEL_TILE;
   const uint64_t blockChannel = tiling->c < channelLimit ? tiling->c : channelLimit;
 
   MhcPostBackwardTilingDataArch22 result = {};
@@ -336,7 +343,7 @@ class KernelWorker
       TPipe pipe;
 
       MhcPostBackwardTilingDataArch22 postTiling = MakePostGradTiling(tiling);
-      const bool fusePreGradient = postTiling.blockChannel > DEFAULT_POST_GRAD_CHANNEL_TILE;
+      const bool fusePreGradient = FusePreGradient(tiling);
       if (!fusePreGradient) {
         MhcPreGradKernel<DTYPE_X, DTYPE_PHI, false> preGrad;
         InitMhcPreGradTask(preGrad, pipe, tiling, addresses);

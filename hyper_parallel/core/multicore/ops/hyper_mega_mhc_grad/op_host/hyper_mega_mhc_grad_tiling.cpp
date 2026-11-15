@@ -6,6 +6,7 @@
 #include "mhc_pre_sinkhorn_backward/arch22/mhc_pre_sinkhorn_backward_data_arch22.h"
 #include "mhc_pre_sinkhorn_backward_tiling/mhc_pre_sinkhorn_backward_tiling.h"
 #include "../op_kernel/hyper_mega_mhc_grad_tiling_key.h"
+#include "../op_kernel/hyper_mega_mhc_grad_workspace.h"
 #include "register/op_def_registry.h"
 #include "../op_kernel/runtime/runtime_storage_bounds_host.h"
 
@@ -41,7 +42,9 @@ ge::graphStatus TilingFunc(gert::TilingContext *context) {
   nativeUserWorkspace += 2 * tokens * streams * hiddenSize * sizeof(float);
   uint64_t additional = AlignUp(nativeUserWorkspace) - nativeUserWorkspace;
   additional += AlignUp(tokens * hiddenSize * sizeof(uint16_t));
-  additional += AlignUp(tokens * streams * hiddenSize * sizeof(uint16_t));
+  if (streams != HyperMegaMhcGradWorkspace::FUSED_STREAMS || hiddenSize != HyperMegaMhcGradWorkspace::FUSED_HIDDEN_SIZE) {
+    additional += AlignUp(tokens * streams * hiddenSize * sizeof(uint16_t));
+  }
   additional += AlignUp(tokens * sizeof(float));
   size_t *workspace = context->GetWorkspaceSizes(1);
   if (workspace == nullptr) {
