@@ -36,6 +36,8 @@ constexpr int64_t WORKSPACE_ALIGNMENT = 512;
 constexpr uint32_t RMS_BF16_BUFFER_SIZE = 5760;
 constexpr uint32_t RMS_BF16_DATA_TYPE = 2;
 constexpr int64_t ZERO_COPY_ELEMENTS = 256;
+constexpr uint64_t DEFAULT_POST_GRAD_CHANNEL_TILE = 1024;
+constexpr uint64_t WIDE_POST_GRAD_CHANNEL_TILE = 1792;
 
 __aicore__ inline int64_t AlignWorkspace(int64_t value) {
   return (value + WORKSPACE_ALIGNMENT - 1) / WORKSPACE_ALIGNMENT * WORKSPACE_ALIGNMENT;
@@ -118,7 +120,12 @@ __aicore__ inline RmsNormGradTilingData MakeRmsGradTaskTiling(const MhcPreSinkho
 __aicore__ inline MhcPostBackwardTilingDataArch22 MakePostGradTiling(
   const MhcPreSinkhornBackwardArch22TilingData *tiling) {
   uint64_t tokens = tiling->batchSize * tiling->seqLength;
-  uint64_t blockChannel = tiling->c < 1024 ? tiling->c : 1024;
+  // Four streams of two-byte activations need 100 bytes per channel after
+  // dropping the mix-coefficient broadcast scratch. Keep each tile below UB capacity.
+  const uint64_t channelLimit = tiling->c == 5120 && tiling->n == 4 && sizeof(DTYPE_X) == 2
+                                    ? WIDE_POST_GRAD_CHANNEL_TILE
+                                    : DEFAULT_POST_GRAD_CHANNEL_TILE;
+  const uint64_t blockChannel = tiling->c < channelLimit ? tiling->c : channelLimit;
 
   MhcPostBackwardTilingDataArch22 result = {};
   result.singleCoreBS = tokens;

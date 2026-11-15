@@ -106,6 +106,11 @@
             "path": "hyper_parallel/core/multicore/ops/mhc_post_backward_and_pre_sinkhorn_backward_4_task_primitives.patch",
             "sha256": "12434fae310dca30b53bc285a0a54af49e221275c52b9b3437302d2f851c005e",
             "purpose": "expose task-local Prepare, PhiRms, and PreviousX worker primitives"
+          },
+          {
+            "path": "hyper_parallel/core/multicore/ops/mhc_post_backward_scalar_mix.patch",
+            "sha256": "9e18b7142c41644c5e223e80fa755491b646b19743a356e82bbe120d7e5bca46",
+            "purpose": "reuse post-gradient vector scratch and bound the channel tile footprint"
           }
         ],
         "upgrade_policy": "a version change must pass HyperMegaMhc accuracy and performance validation"
