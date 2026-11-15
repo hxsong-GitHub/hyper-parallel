@@ -79,6 +79,7 @@ class DeepseekV41HyperMegaMhc(DeepseekV41PipelinedHyperConnection):
             module_fqn: str = "",
             context: Mapping[str, Any] | None = None,
             token_tile: int = 32,
+            checkpoint_cache: str = "none",
     ) -> None:
         """Adopt source parameters and validate the initial fused-kernel contract."""
         del module_fqn, context
@@ -94,6 +95,9 @@ class DeepseekV41HyperMegaMhc(DeepseekV41PipelinedHyperConnection):
             )
         self.norm_eps = _rms_norm_eps(self.input_norm)
         self.token_tile = token_tile
+        if checkpoint_cache not in ("none", "projection", "mappings"):
+            raise ValueError(f"Unknown mHC checkpoint cache policy: {checkpoint_cache!r}")
+        self.checkpoint_cache = checkpoint_cache
 
     def advance(
             self,
@@ -137,6 +141,7 @@ class DeepseekV41HyperMegaMhc(DeepseekV41PipelinedHyperConnection):
             norm_eps=self.norm_eps,
             num_iters=self.hc_sinkhorn_iters,
             token_tile=self.token_tile,
+            checkpoint_cache=self.checkpoint_cache,
         )
         if not type(self)._native_forward_reported:
             logger.info_rank0("HyperMegaMhc native NPU forward engaged")

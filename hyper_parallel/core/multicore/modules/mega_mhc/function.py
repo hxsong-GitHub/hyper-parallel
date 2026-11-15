@@ -201,6 +201,7 @@ class _HyperMegaMhcFunction(torch.autograd.Function):
         norm_eps: float,
         num_iters: int,
         token_tile: int,
+        checkpoint_cache: str,
     ) -> MegaMhcOutputs:
         """Launch HyperMegaMhc and save its explicit native cache.
 
@@ -219,21 +220,27 @@ class _HyperMegaMhcFunction(torch.autograd.Function):
             norm_eps: Numerical epsilon used by RMS normalization.
             num_iters: Number of Sinkhorn normalization iterations.
             token_tile: Number of token rows assigned to a task tile.
+            checkpoint_cache: Optional compact coefficient retention during HP checkpoint replay.
         """
-        outputs, cache = _hyper_mega_mhc_forward(
-            previous_output,
-            residual,
-            previous_pre_mix,
-            previous_post_mix,
-            previous_residual_mix,
-            phi,
-            alpha,
-            bias,
-            norm_weight,
+        from .checkpoint_cache import checkpoint_forward  # pylint: disable=import-outside-toplevel
+
+        outputs, cache = checkpoint_forward(
+            _hyper_mega_mhc_forward,
+            (
+                previous_output,
+                residual,
+                previous_pre_mix,
+                previous_post_mix,
+                previous_residual_mix,
+                phi,
+                alpha,
+                bias,
+                norm_weight,
+            ),
+            checkpoint_cache,
             hc_eps=hc_eps,
             norm_eps=norm_eps,
             num_iters=num_iters,
-            need_backward=True,
             token_tile=token_tile,
         )
         ctx.save_for_backward(
@@ -308,7 +315,7 @@ class _HyperMegaMhcFunction(torch.autograd.Function):
             hc_eps=ctx.hc_eps,
             token_tile=ctx.token_tile,
         )
-        return (*gradients, None, None, None, None)
+        return (*gradients, None, None, None, None, None)
 
 
 def hyper_mega_mhc(
@@ -327,8 +334,17 @@ def hyper_mega_mhc(
     num_iters: int = MHC_SINKHORN_ITERS,
     need_backward: bool = True,
     token_tile: int = DEFAULT_TOKEN_TILE,
+    checkpoint_cache: str = "none",
 ) -> MegaMhcOutputs:
-    """Run the fused shifted boundary with its matching autograd backward."""
+    """Run the fused shifted boundary with its matching autograd backward.
+
+    ``checkpoint_cache`` retains either projection coefficients or complete
+    small mapping histories within an HP activation-checkpoint invocation.
+    It has no effect outside an active HP checkpoint region.
+    """
+    from .checkpoint_cache import validate_cache_mode  # pylint: disable=import-outside-toplevel
+
+    validate_cache_mode(checkpoint_cache)
     differentiable_inputs = (
         previous_output,
         residual,
@@ -349,6 +365,7 @@ def hyper_mega_mhc(
             norm_eps,
             num_iters,
             token_tile,
+            checkpoint_cache,
         )
     outputs, _ = _hyper_mega_mhc_forward(
         *differentiable_inputs,
